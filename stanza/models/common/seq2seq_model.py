@@ -227,7 +227,9 @@ class Seq2SeqModel(nn.Module):
                 raw_zeros = raw_inputs.new_zeros((raw_inputs.shape[0], 1, raw_inputs.shape[2]))
                 raw_inputs = torch.cat([raw_inputs, raw_zeros], dim=1)
             enc_inputs = torch.cat([enc_inputs, raw_inputs], dim=2)
-        src_lens = list(src_mask.data.eq(constant.PAD_ID).long().sum(1))
+        # one copy of all the lengths: pack_padded_sequence would copy a list
+        # of device scalars to the host one at a time, each copy waiting for the GPU
+        src_lens = src_mask.data.eq(constant.PAD_ID).long().sum(1).tolist()
         return enc_inputs, batch_size, src_lens, src_mask
 
     def forward(self, src, src_mask, tgt_in, pos=None, raw=None):
