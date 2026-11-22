@@ -3,8 +3,10 @@ Basic testing of lemmatization
 """
 
 import copy
+import os
 
 import pytest
+import torch
 import stanza
 
 from stanza.tests import *
@@ -283,3 +285,159 @@ def test_store_results_does_not_change_any_lemma():
     doc = nlp("The dogs barked.")
     dogs = [word for word in doc.sentences[0].words if word.text == "dogs"]
     assert dogs[0].lemma == "dog", "the model's dictionary should answer before the cache"
+
+
+
+DEVICES = [False] + ([True] if torch.cuda.is_available() else [])
+
+# made up words, grouped by what the edit classifier of the English test model
+# does with them: the decoder writes the lemma of the first group (two of them
+# copy a character the model has never seen), the second group is returned
+# unchanged and the third is lowercased
+DECODED = [("snarfiest", "ADJ"), ("wugs", "NOUN"), ("grobbled", "VERB"), ("QUAXES", "NOUN"),
+           ("Wuggeries", "NOUN"), ("blicжets", "NOUN"), ("snarŋings", "NOUN")]
+KEPT = [("Zorbles", "PROPN"), ("Snarfington", "PROPN"), ("Quorbish", "ADJ"), ("quibbagesz", "NOUN")]
+LOWERED = [("BLORF", "NOUN"), ("ZORBLAX", "X")]
+KNOWN = [("The", "DET"), ("dogs", "NOUN"), ("were", "AUX"), ("running", "VERB")]
+
+# the lemmas Stanza gave these words before decoding was sped up, on CPU and GPU
+NOCHARLM_LEMMAS = dict(zip(DECODED + KEPT + LOWERED + KNOWN,
+                           ["snarfy", "wug", "grobble", "quax", "wuggery", "blicжet", "snarŋing",
+                            "Zorbles", "Snarfington", "Quorbish", "quibbagesz", "blorf", "zorblax",
+                            "the", "dog", "be", "run"]))
+# Zorbles is left out: the charlm model gave it Zorble on CPU and Zorbles on GPU
+# before the speedup too
+CHARLM_LEMMAS = dict(zip(DECODED + KEPT[1:] + LOWERED + KNOWN,
+                         ["snarfy", "wug", "grobble", "qual", "wuggery", "blicжet", "snarŋing",
+                          "Snarfington", "quorbish", "quibbagesz", "blorf", "zorblax",
+                          "the", "dog", "be", "run"]))
+
+def charlm_options():
+    models = os.path.join(TEST_MODELS_DIR, "en")
+    return {"lemma_model_path": os.path.join(models, "lemma", "combined_charlm.pt"),
+            "lemma_forward_charlm_path": os.path.join(models, "forward_charlm", "1billion.pt"),
+            "lemma_backward_charlm_path": os.path.join(models, "backward_charlm", "1billion.pt"),
+            "lemma_pretrain_path": os.path.join(models, "pretrain", "conll17.pt")}
+
+def tagged_doc(sentences):
+    return stanza.Document([[{"id": i + 1, "text": word, "upos": upos} for i, (word, upos) in enumerate(sentence)]
+                            for sentence in sentences])
+
+def pretagged_pipeline(use_gpu, batch_size=50, **kwargs):
+    return stanza.Pipeline('en', processors='tokenize,lemma', model_dir=TEST_MODELS_DIR, download_method=None,
+                           tokenize_pretokenized=True, lemma_pretagged=True, lemma_batch_size=batch_size,
+                           use_gpu=use_gpu, **kwargs)
+
+def lemmas_of(doc):
+    return [(word.text, word.upos, word.lemma) for sentence in doc.sentences for word in sentence.words]
+
+def assert_made_up(trainer, words):
+    for word, _ in words:
+        assert all(word not in entries for entries in trainer.pos_dict.values()), f"{word} is in the dictionary"
+
+def mixed_sentences(words):
+    """The words in sentences of different lengths, in different orders, with repeats"""
+    decoded = [w for w in DECODED if w in words]
+    others = [w for w in KEPT + LOWERED + KNOWN if w in words]
+    return [decoded[:3] + others[:4], others[::-1] + decoded[2:] + decoded[:2], decoded[::-1],
+            decoded[3:] * 2 + others[4:], others + decoded]
+
+@pytest.mark.parametrize("use_gpu", DEVICES)
+@pytest.mark.parametrize("model", ["nocharlm", "charlm"])
+@pytest.mark.parametrize("options", [{"lemma_store_results": False}, {"lemma_store_results": True},
+                                     {"lemma_ensemble_dict": False}, {"lemma_beam_size": 3}, {"lemma_dict_only": True}])
+def test_lemmas_do_not_change_with_the_batch(use_gpu, model, options):
+    """Every word gets the lemma Stanza gave it before decoding was sped up, whatever
+    the batch size and whatever words share its batch: words the decoder writes,
+    words returned unchanged or lowercased, dictionary words, and repeats."""
+    expected = NOCHARLM_LEMMAS if model == "nocharlm" else CHARLM_LEMMAS
+    extra = charlm_options() if model == "charlm" else {}
+    if options.get("lemma_dict_only"):
+        # without the seq2seq model, a word the dictionary does not know is its own lemma
+        expected = {key: (lemma if key in KNOWN else key[0]) for key, lemma in expected.items()}
+    sentences = mixed_sentences(expected)
+    for batch_size in (1, 2, 3, 7, 1000):
+        nlp = pretagged_pipeline(use_gpu, batch_size=batch_size, **extra, **options)
+        assert_made_up(nlp.processors['lemma'].trainer, [w for w in expected if w not in KNOWN])
+        got = lemmas_of(nlp(tagged_doc(sentences)))
+        assert got == [(word, upos, expected[(word, upos)]) for sentence in sentences for word, upos in sentence], \
+            f"lemma_batch_size={batch_size} changed a lemma"
+
+@pytest.mark.parametrize("use_gpu", DEVICES)
+def test_documents_with_nothing_to_decode(use_gpu):
+    """An empty document, and one whose words are all in the dictionary, get through."""
+    nlp = pretagged_pipeline(use_gpu, lemma_store_results=False)
+    assert lemmas_of(nlp(stanza.Document([]))) == []
+    assert lemmas_of(nlp(tagged_doc([KNOWN]))) == [(word, upos, NOCHARLM_LEMMAS[(word, upos)]) for word, upos in KNOWN]
+
+def count_decoded_rows(nlp):
+    """Records the number of words in each decoding step of the seq2seq model."""
+    model = nlp.processors['lemma'].trainer.model
+    rows = []
+    decode = model.decode
+    def counting(dec_inputs, *args, **kwargs):
+        rows.append(dec_inputs.size(0))
+        return decode(dec_inputs, *args, **kwargs)
+    model.decode = counting
+    return rows
+
+@pytest.mark.parametrize("use_gpu", DEVICES)
+def test_decoder_skips_the_words_it_does_not_write(use_gpu):
+    """Words the edit classifier returns unchanged or lowercased get their lemma
+    without being decoded; the decoder only reads the words whose lemma it writes."""
+    nlp = pretagged_pipeline(use_gpu, lemma_store_results=False)
+    assert_made_up(nlp.processors['lemma'].trainer, DECODED + KEPT + LOWERED)
+    rows = count_decoded_rows(nlp)
+    sentence = KEPT + LOWERED
+    assert lemmas_of(nlp(tagged_doc([sentence]))) == [(w, u, NOCHARLM_LEMMAS[(w, u)]) for w, u in sentence]
+    assert rows == [], "words returned unchanged or lowercased were decoded"
+
+    sentence = KEPT + DECODED + LOWERED
+    assert lemmas_of(nlp(tagged_doc([sentence]))) == [(w, u, NOCHARLM_LEMMAS[(w, u)]) for w, u in sentence]
+    assert rows, "the made up words should reach the decoder"
+    assert max(rows) == len(DECODED), "the decoder should read exactly the words whose lemma it writes"
+
+def count_gpu_waits(nlp, doc):
+    """Runs nlp on doc and counts the times the host waits for the GPU."""
+    import warnings
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("warn")
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            nlp(doc)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    return sum("synchroniz" in str(warning.message) for warning in caught)
+
+def made_up_nouns(ending, n=32):
+    """n made up nouns that end in ending, so that all of them have one length"""
+    import itertools
+    return [("".join(x) + ending, "NOUN") for x in itertools.product("bdgkmpst", repeat=2)][:n]
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_gpu_waits_do_not_grow_with_the_words_decoded():
+    """On a GPU, decoding more words of the same length in one batch adds no waits
+    for the device: the decoded characters come to the host once per step."""
+    nlp = pretagged_pipeline(True, batch_size=1000, lemma_store_results=False)
+    words = made_up_nouns("orfings")
+    assert_made_up(nlp.processors['lemma'].trainer, words)
+    few = count_gpu_waits(nlp, tagged_doc([words[:8]]))
+    many = count_gpu_waits(nlp, tagged_doc([words]))
+    assert many - few < 32 - 8, f"{few} waits for 8 words, {many} for 32: at least one more per word"
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_gpu_waits_once_per_decoding_step():
+    """On a GPU, each decoding step waits for the device once, to read the decoded
+    characters: longer lemmas take more steps, and no more than one wait each."""
+    nlp = pretagged_pipeline(True, batch_size=1000, lemma_store_results=False)
+    short, long = made_up_nouns("orfings", 8), made_up_nouns("orfiplonkerbatings", 8)
+    assert_made_up(nlp.processors['lemma'].trainer, short + long)
+    steps = count_decoded_rows(nlp)
+    short_waits = count_gpu_waits(nlp, tagged_doc([short]))
+    short_steps = len(steps)
+    long_waits = count_gpu_waits(nlp, tagged_doc([long]))
+    long_steps = len(steps) - short_steps
+    assert long_steps > short_steps, "the longer words should take more decoding steps"
+    assert long_waits - short_waits <= long_steps - short_steps, \
+        f"{long_steps - short_steps} more steps took {long_waits - short_waits} more waits"

@@ -121,3 +121,16 @@ def test_unknown_word():
     trainer = mwt_processor.trainer
     expansion = trainer.dict_expansion("newspaper's")
     assert expansion is None
+
+
+@pytest.mark.parametrize("use_gpu", [False] + ([True] if __import__("torch").cuda.is_available() else []))
+def test_mwt_seq2seq_expansions(use_gpu):
+    """Tokens the French expansion dictionary does not know are expanded by the
+    seq2seq model: these are the expansions it gave before decoding was sped up."""
+    nlp = stanza.Pipeline('fr', processors='tokenize,mwt', model_dir=TEST_MODELS_DIR, download_method=None,
+                          tokenize_pretokenized=True, use_gpu=use_gpu)
+    expected = {"auxblorfs": ["à", "lexblos"], "auxquellesblick": ["à", "lesquelle"], "duzorb": ["duzorb"],
+                "desquibbages": ["desquibbages"], "duжorb": ["duжorb"], "du": ["de", "le"], "aux": ["à", "les"]}
+    doc = stanza.Document([[{"id": i + 1, "text": token, "misc": "MWT=Yes"} for i, token in enumerate(expected)]])
+    doc = nlp.processors['mwt'].process(doc)
+    assert {token.text: [word.text for word in token.words] for token in doc.sentences[0].tokens} == expected
