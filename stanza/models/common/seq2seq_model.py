@@ -266,16 +266,31 @@ class Seq2SeqModel(nn.Module):
         else:
             edit_logits = None
 
+        output_seqs = [[] for _ in range(batch_size)]
+        rows = list(range(batch_size))
+        if self.edit:
+            edits = np.argmax(edit_logits.data.cpu().numpy(), axis=1)
+            rows = np.nonzero(edits == 0)[0].tolist()
+            if len(rows) == 0:
+                return output_seqs, edit_logits
+            if len(rows) < batch_size:
+                idx = torch.as_tensor(rows, device=h_in.device)
+                h_in = h_in.index_select(0, idx)
+                hn = hn.index_select(0, idx)
+                cn = cn.index_select(0, idx)
+                src_mask = src_mask.index_select(0, idx)
+                src = src.index_select(0, idx)
+        num_rows = len(rows)
+
         # greedy decode by step
         dec_inputs = self.embedding(self.SOS_tensor)
-        dec_inputs = dec_inputs.expand(batch_size, dec_inputs.size(0), dec_inputs.size(1))
+        dec_inputs = dec_inputs.expand(num_rows, dec_inputs.size(0), dec_inputs.size(1))
 
-        done = [False for _ in range(batch_size)]
+        done = [False for _ in range(num_rows)]
         total_done = 0
         max_len = 0
-        output_seqs = [[] for _ in range(batch_size)]
 
-        while total_done < batch_size and max_len < self.max_dec_len:
+        while total_done < num_rows and max_len < self.max_dec_len:
             log_probs, (hn, cn) = self.decode(dec_inputs, hn, cn, h_in, src_mask, src=src, never_decode_unk=never_decode_unk)
             assert log_probs.size(1) == 1, "Output must have 1-step of output."
             _, preds = log_probs.squeeze(1).max(1, keepdim=True)
@@ -285,14 +300,14 @@ class Seq2SeqModel(nn.Module):
             dec_inputs[dec_inputs >= self.vocab_size] = UNK_ID
             dec_inputs = self.embedding(dec_inputs) # update decoder inputs
             max_len += 1
-            for i in range(batch_size):
+            for i in range(num_rows):
                 if not done[i]:
                     token = preds.data[i][0].item()
                     if token == constant.EOS_ID:
                         done[i] = True
                         total_done += 1
                     else:
-                        output_seqs[i].append(token)
+                        output_seqs[rows[i]].append(token)
         return output_seqs, edit_logits
 
     def predict(self, src, src_mask, pos=None, beam_size=5, raw=None, never_decode_unk=False):
