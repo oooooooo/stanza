@@ -91,24 +91,20 @@ class LemmaProcessor(UDProcessor):
             self._requires = LemmaProcessor.REQUIRES_DEFAULT
 
     def process(self, document):
-        if not self.use_identity:
-            batch = DataLoader(document, self.config['batch_size'], self.config, vocab=self.vocab, evaluation=True, expand_unk_vocab=True)
-        else:
-            batch = DataLoader(document, self.config['batch_size'], self.config, evaluation=True, conll_only=True)
         if self.use_identity:
-            preds = [word.text for sent in batch.doc.sentences for word in sent.words]
+            preds = [word.text for sent in document.sentences for word in sent.words]
         elif self.config.get('dict_only', False):
-            preds = self.trainer.predict_dict(batch.doc.get([doc.TEXT, doc.UPOS]))
+            preds = self.trainer.predict_dict(document.get([doc.TEXT, doc.UPOS]))
         else:
             if self.config.get('ensemble_dict', False):
                 # skip the seq2seq model when we can
-                word_tags_for_skip = batch.doc.get([doc.TEXT, doc.UPOS])
-                skip = self.trainer.skip_seq2seq(word_tags_for_skip)
+                word_tags = document.get(WORD_TAGS)
+                skip = self.trainer.skip_seq2seq(word_tags)
                 if self.store_results:
                     # a remembered answer is as good as a dictionary hit for skipping
                     skip = [
                         was_skipped or self._recall(word, pos) is not None
-                        for was_skipped, (word, pos) in zip(skip, word_tags_for_skip)
+                        for was_skipped, (word, pos) in zip(skip, word_tags)
                     ]
                 # although there is no explicit use of caseless or lemma_caseless in this processor,
                 # it shows up in the config which gets passed to the DataLoader,
@@ -116,7 +112,7 @@ class LemmaProcessor(UDProcessor):
                 seq2seq_batch = DataLoader(document, self.config['batch_size'], self.config, vocab=self.vocab,
                                            evaluation=True, skip=skip, expand_unk_vocab=True)
             else:
-                seq2seq_batch = batch
+                seq2seq_batch = DataLoader(document, self.config['batch_size'], self.config, vocab=self.vocab, evaluation=True, expand_unk_vocab=True)
 
             with torch.no_grad():
                 preds = []
@@ -128,7 +124,6 @@ class LemmaProcessor(UDProcessor):
                         edits += es
 
             if self.config.get('ensemble_dict', False):
-                word_tags = batch.doc.get(WORD_TAGS)
                 words = [x[0] for x in word_tags]
                 preds = self.trainer.postprocess([x for x, y in zip(words, skip) if not y], preds, edits=edits)
                 if self.store_results:
@@ -157,12 +152,12 @@ class LemmaProcessor(UDProcessor):
                     ]
                 preds = self.trainer.ensemble(word_tags, preds1)
             else:
-                preds = self.trainer.postprocess(batch.doc.get([doc.TEXT]), preds, edits=edits)
+                preds = self.trainer.postprocess(document.get([doc.TEXT]), preds, edits=edits)
 
             if self.trainer.has_contextual_lemmatizers():
-                preds = self.trainer.update_contextual_preds(batch.doc, preds)
+                preds = self.trainer.update_contextual_preds(document, preds)
 
         # map empty string lemmas to '_'
         preds = [max([(len(x), x), (0, '_')])[1] for x in preds]
-        batch.doc.set([doc.LEMMA], preds)
-        return batch.doc
+        document.set([doc.LEMMA], preds)
+        return document
