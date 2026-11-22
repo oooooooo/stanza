@@ -131,8 +131,11 @@ class Seq2SeqModel(nn.Module):
         cn = torch.cat((cn[-1], cn[-2]), 1)
         return h_in, (hn, cn)
 
-    def decode(self, dec_inputs, hn, cn, ctx, ctx_mask=None, src=None, never_decode_unk=False):
-        """ Decode a step, based on context encoding and source context states."""
+    def decode(self, dec_inputs, hn, cn, ctx, ctx_mask=None, src=None, never_decode_unk=False, copy_vocab_size=None):
+        """ Decode a step, based on context encoding and source context states.
+
+        copy_vocab_size: max(vocab_size, max(src) + 1), when the caller knows it
+        """
         dec_hidden = (hn, cn)
         decoder_output = self.decoder(dec_inputs, dec_hidden, ctx, ctx_mask, return_logattn=self.copy)
         if self.copy:
@@ -167,7 +170,9 @@ class Seq2SeqModel(nn.Module):
             # previously unknown vocab item
             copy_prob = torch.exp(log_copy_prob)
             copied_vocab_shape = list(log_probs.size())
-            if torch.max(src) >= copied_vocab_shape[-1]:
+            if copy_vocab_size is not None:
+                copied_vocab_shape[-1] = copy_vocab_size
+            elif torch.max(src) >= copied_vocab_shape[-1]:
                 copied_vocab_shape[-1] = torch.max(src) + 1
             copied_vocab_prob = log_probs.new_zeros(copied_vocab_shape)
             scattered_copy = src.unsqueeze(1).expand(src.size(0), copy_prob.size(1), src.size(1))
@@ -287,6 +292,9 @@ class Seq2SeqModel(nn.Module):
                 src_mask = src_mask.index_select(0, idx)
                 src = src.index_select(0, idx)
         num_rows = len(rows)
+        # src does not change while decoding: reading its maximum once spares
+        # decode one wait for the GPU per step
+        copy_vocab_size = max(self.vocab_size, int(src.max()) + 1) if self.copy else None
 
         # greedy decode by step
         dec_inputs = self.embedding(self.SOS_tensor)
@@ -297,7 +305,7 @@ class Seq2SeqModel(nn.Module):
         max_len = 0
 
         while total_done < num_rows and max_len < self.max_dec_len:
-            log_probs, (hn, cn) = self.decode(dec_inputs, hn, cn, h_in, src_mask, src=src, never_decode_unk=never_decode_unk)
+            log_probs, (hn, cn) = self.decode(dec_inputs, hn, cn, h_in, src_mask, src=src, never_decode_unk=never_decode_unk, copy_vocab_size=copy_vocab_size)
             assert log_probs.size(1) == 1, "Output must have 1-step of output."
             _, preds = log_probs.squeeze(1).max(1, keepdim=True)
             # if a unlearned character is predicted via the copy mechanism,
