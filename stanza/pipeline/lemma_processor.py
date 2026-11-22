@@ -92,7 +92,12 @@ class LemmaProcessor(UDProcessor):
 
     def process(self, document):
         if not self.use_identity:
-            batch = DataLoader(document, self.config['batch_size'], self.config, vocab=self.vocab, evaluation=True, expand_unk_vocab=True)
+            if self.config.get('ensemble_dict', False) and not self.config.get('dict_only', False):
+                # only batch.doc is read in this mode: the seq2seq batches
+                # are built below from the words the dictionary does not answer
+                batch = DataLoader(document, self.config['batch_size'], self.config, evaluation=True, conll_only=True)
+            else:
+                batch = DataLoader(document, self.config['batch_size'], self.config, vocab=self.vocab, evaluation=True, expand_unk_vocab=True)
         else:
             batch = DataLoader(document, self.config['batch_size'], self.config, evaluation=True, conll_only=True)
         if self.use_identity:
