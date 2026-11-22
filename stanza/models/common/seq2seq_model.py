@@ -300,9 +300,10 @@ class Seq2SeqModel(nn.Module):
             dec_inputs[dec_inputs >= self.vocab_size] = UNK_ID
             dec_inputs = self.embedding(dec_inputs) # update decoder inputs
             max_len += 1
+            tokens = preds.squeeze(1).tolist()
             for i in range(num_rows):
                 if not done[i]:
-                    token = preds.data[i][0].item()
+                    token = tokens[i]
                     if token == constant.EOS_ID:
                         done[i] = True
                         total_done += 1
