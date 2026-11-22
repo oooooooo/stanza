@@ -3,8 +3,10 @@ Basic testing of lemmatization
 """
 
 import copy
+import os
 
 import pytest
+import torch
 import stanza
 
 from stanza.tests import *
@@ -283,3 +285,167 @@ def test_store_results_does_not_change_any_lemma():
     doc = nlp("The dogs barked.")
     dogs = [word for word in doc.sentences[0].words if word.text == "dogs"]
     assert dogs[0].lemma == "dog", "the model's dictionary should answer before the cache"
+
+
+DEVICES = [False] + ([True] if torch.cuda.is_available() else [])
+
+DECODED = [("snarfiest", "ADJ"), ("wugs", "NOUN"), ("grobbled", "VERB"), ("QUAXES", "NOUN"),
+           ("Wuggeries", "NOUN"), ("blicжets", "NOUN"), ("snarŋings", "NOUN")]
+KEPT = [("Zorbles", "PROPN"), ("Snarfington", "PROPN"), ("Quorbish", "ADJ"), ("quibbagesz", "NOUN")]
+LOWERED = [("BLORF", "NOUN"), ("ZORBLAX", "X")]
+KNOWN = [("The", "DET"), ("dogs", "NOUN"), ("were", "AUX"), ("running", "VERB"),
+         ("saw", "NOUN"), ("saw", "VERB"), ("left", "ADJ")]
+
+NOCHARLM_LEMMAS = dict(zip(DECODED + KEPT + LOWERED + KNOWN,
+                           ["snarfy", "wug", "grobble", "quax", "wuggery", "blicжet", "snarŋing",
+                            "Zorbles", "Snarfington", "Quorbish", "quibbagesz", "blorf", "zorblax",
+                            "the", "dog", "be", "run", "saw", "see", "left"]))
+# Zorbles is left out because the charlm model gives it Zorble on CPU and Zorbles on GPU
+CHARLM_LEMMAS = dict(zip(DECODED + KEPT[1:] + LOWERED + KNOWN,
+                         ["snarfy", "wug", "grobble", "qual", "wuggery", "blicжet", "snarŋing",
+                          "Snarfington", "quorbish", "quibbagesz", "blorf", "zorblax",
+                          "the", "dog", "be", "run", "saw", "see", "left"]))
+
+BATCH_SIZES = (1, 2, 3, 1000)
+
+def charlm_options():
+    models = os.path.join(TEST_MODELS_DIR, "en")
+    return {"lemma_model_path": os.path.join(models, "lemma", "combined_charlm.pt"),
+            "lemma_forward_charlm_path": os.path.join(models, "forward_charlm", "1billion.pt"),
+            "lemma_backward_charlm_path": os.path.join(models, "backward_charlm", "1billion.pt"),
+            "lemma_pretrain_path": os.path.join(models, "pretrain", "conll17.pt")}
+
+def tagged_doc(sentences):
+    return stanza.Document([[{"id": i + 1, "text": word, "upos": upos} for i, (word, upos) in enumerate(sentence)]
+                            for sentence in sentences])
+
+def pretagged_pipeline(use_gpu, **kwargs):
+    return stanza.Pipeline('en', processors='tokenize,lemma', model_dir=TEST_MODELS_DIR, download_method=None,
+                           tokenize_pretokenized=True, lemma_pretagged=True, use_gpu=use_gpu, **kwargs)
+
+def lemmas_of(doc):
+    return [(word.text, word.upos, word.lemma) for sentence in doc.sentences for word in sentence.words]
+
+def mixed_sentences(words):
+    """The words in sentences of different lengths and orders, with repeats"""
+    decoded = [w for w in DECODED if w in words]
+    others = [w for w in KEPT + LOWERED + KNOWN if w in words]
+    return [decoded[:3] + others[:4], others[::-1] + decoded[2:] + decoded[:2], decoded[::-1],
+            decoded[3:] * 2 + others[4:], others + decoded]
+
+def assert_made_up(trainer, words):
+    for word, _ in words:
+        assert all(word not in entries for entries in trainer.pos_dict.values()), f"{word} is in the dictionary"
+
+def assert_edit_classes(nlp):
+    """The test model writes the lemmas of DECODED and returns KEPT and LOWERED as they are or lowercased"""
+    from stanza.models.lemma.data import DataLoader
+    from stanza.models.lemma.edit import EDIT_TO_ID
+    lemmatizer = nlp.processors['lemma']
+    words = DECODED + KEPT + LOWERED
+    batch = DataLoader(tagged_doc([words]), 1000, lemmatizer.config, vocab=lemmatizer.vocab,
+                       evaluation=True, expand_unk_vocab=True)
+    _, edits = lemmatizer.trainer.predict(next(iter(batch)), 1, batch.vocab)
+    expected = [EDIT_TO_ID[name] for name, group in (("none", DECODED), ("identity", KEPT), ("lower", LOWERED))
+                for _ in group]
+    assert edits == expected, "the model no longer sorts the made up words into the edit classes the tests need"
+
+@pytest.mark.parametrize("use_gpu", DEVICES)
+@pytest.mark.parametrize("model", ["nocharlm", "charlm"])
+@pytest.mark.parametrize("options", [{}, {"lemma_ensemble_dict": False}, {"lemma_beam_size": 3}, {"lemma_dict_only": True}])
+def test_lemmas_do_not_change_with_the_batch(use_gpu, model, options):
+    """Every word keeps its lemma whatever the batch size and the words sharing its batch:
+    words the seq2seq model writes, words it returns unchanged or lowercased, dictionary words."""
+    expected = NOCHARLM_LEMMAS if model == "nocharlm" else CHARLM_LEMMAS
+    if options.get("lemma_dict_only"):
+        expected = {key: (lemma if key in KNOWN else key[0]) for key, lemma in expected.items()}
+    extra = charlm_options() if model == "charlm" else {}
+    nlp = pretagged_pipeline(use_gpu, lemma_store_results=False, **extra, **options)
+    assert_made_up(nlp.processors['lemma'].trainer, [w for w in expected if w not in KNOWN])
+    if model == "nocharlm" and not options:
+        assert_edit_classes(nlp)
+    sentences = mixed_sentences(expected)
+    gold = [(word, upos, expected[(word, upos)]) for sentence in sentences for word, upos in sentence]
+    for batch_size in BATCH_SIZES:
+        nlp.processors['lemma'].config['batch_size'] = batch_size
+        assert lemmas_of(nlp(tagged_doc(sentences))) == gold, f"lemma_batch_size={batch_size} changed a lemma"
+
+@pytest.mark.parametrize("use_gpu", DEVICES)
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+def test_lemmas_do_not_change_with_the_batch_when_results_are_stored(use_gpu, batch_size):
+    """With lemma_store_results on, as by default, each word keeps its lemma on the first
+    document, which fills the cache, and on the second, which reads it."""
+    nlp = pretagged_pipeline(use_gpu, lemma_batch_size=batch_size)
+    sentences = mixed_sentences(NOCHARLM_LEMMAS)
+    gold = [(word, upos, NOCHARLM_LEMMAS[(word, upos)]) for sentence in sentences for word, upos in sentence]
+    assert lemmas_of(nlp(tagged_doc(sentences))) == gold
+    assert lemmas_of(nlp(tagged_doc(sentences))) == gold
+
+@pytest.mark.parametrize("use_gpu", DEVICES)
+def test_documents_with_nothing_to_decode(use_gpu):
+    """An empty document gets through, and a document whose words the seq2seq model
+    only returns unchanged or lowercased gets their lemmas."""
+    nlp = pretagged_pipeline(use_gpu, lemma_store_results=False, lemma_batch_size=1000)
+    assert lemmas_of(nlp(stanza.Document([]))) == []
+    sentence = KEPT + LOWERED
+    assert lemmas_of(nlp(tagged_doc([sentence]))) == [(w, u, NOCHARLM_LEMMAS[(w, u)]) for w, u in sentence]
+
+@pytest.mark.parametrize("use_gpu", DEVICES)
+def test_raw_text_lemmas_do_not_change_with_the_batch(use_gpu):
+    """Raw text through tokenize, mwt, pos and lemma, with made up words, gets the same
+    lemmas at any lemma_batch_size."""
+    text = "Joe's wugs grobbled the snarfiest Wuggeries. The BLORF's dogs were running to Snarfington."
+    nlp = stanza.Pipeline('en', processors='tokenize,mwt,pos,lemma', model_dir=TEST_MODELS_DIR, download_method=None,
+                          use_gpu=use_gpu, lemma_store_results=False, lemma_batch_size=1000)
+    reference = lemmas_of(nlp(text))
+    assert ("wugs", "NOUN", "wug") in reference, "the seq2seq model should write the lemma of wugs"
+    for batch_size in BATCH_SIZES[:-1]:
+        nlp.processors['lemma'].config['batch_size'] = batch_size
+        assert lemmas_of(nlp(text)) == reference, f"lemma_batch_size={batch_size} changed a lemma"
+
+def decoded_by_batch_size(nlp, words):
+    """The characters the seq2seq model decodes for each word, before the lemmatizer
+    falls back to the word for an output that runs to max_dec_len"""
+    from stanza.models.lemma.data import DataLoader
+    lemmatizer = nlp.processors['lemma']
+    decoded = {}
+    for batch_size in BATCH_SIZES:
+        batches = DataLoader(tagged_doc([words]), batch_size, lemmatizer.config, vocab=lemmatizer.vocab,
+                             evaluation=True, expand_unk_vocab=True)
+        decoded[batch_size] = [characters for batch in batches
+                               for characters in lemmatizer.trainer.predict(batch, 1, batches.vocab)[0]]
+    return decoded
+
+@pytest.fixture(scope="module")
+def no_edit_no_copy_model(tmp_path_factory):
+    from stanza.models import lemmatizer
+    from stanza.tests.lemma.test_lemma_trainer import TRAIN_DATA, DEV_DATA
+    tmp_path = tmp_path_factory.mktemp("no_edit_no_copy")
+    train_file, dev_file = str(tmp_path / "train.conllu"), str(tmp_path / "dev.conllu")
+    for filename, text in ((train_file, TRAIN_DATA), (dev_file, DEV_DATA)):
+        with open(filename, "w", encoding="utf-8") as fout:
+            fout.write(text)
+    lemmatizer.main(["--train_file", train_file, "--eval_file", dev_file, "--output_file", str(tmp_path / "pred.conllu"),
+                     "--num_epoch", "2", "--save_dir", str(tmp_path), "--save_name", "lemma.pt",
+                     "--shorthand", "en_test", "--no_edit", "--no_copy"])
+    return str(tmp_path / "lemma.pt")
+
+@pytest.mark.parametrize("use_gpu", DEVICES)
+def test_model_without_edit_classifier_or_copy(use_gpu, no_edit_no_copy_model):
+    """With a model trained with --no_edit --no_copy, each word keeps its lemma, and the
+    characters the model decodes for it, whatever the batch size."""
+    nlp = pretagged_pipeline(use_gpu, lemma_model_path=no_edit_no_copy_model, lemma_store_results=False)
+    model = nlp.processors['lemma'].trainer.model
+    assert not model.edit and not model.copy
+    words = DECODED + KEPT + LOWERED
+    assert_made_up(nlp.processors['lemma'].trainer, words)
+    decoded = decoded_by_batch_size(nlp, words)
+    assert all(characters for characters in decoded[1]), "the model should decode characters for every word"
+    assert all(characters == decoded[1] for characters in decoded.values()), "decoded characters changed with the batch size"
+
+    sentences = mixed_sentences(words)
+    nlp.processors['lemma'].config['batch_size'] = 1
+    reference = lemmas_of(nlp(tagged_doc(sentences)))
+    for batch_size in BATCH_SIZES[1:]:
+        nlp.processors['lemma'].config['batch_size'] = batch_size
+        assert lemmas_of(nlp(tagged_doc(sentences))) == reference, f"lemma_batch_size={batch_size} changed a lemma"
